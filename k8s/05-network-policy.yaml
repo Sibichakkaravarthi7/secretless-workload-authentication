@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-processor-zero-trust
+  namespace: app-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-processor
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow egress to HashiCorp Vault in the vault namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - protocol: TCP
+          port: 8200

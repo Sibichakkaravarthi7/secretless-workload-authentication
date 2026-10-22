@@ -1,0 +1,160 @@
+# Pattern B: Pure In-Memory Secretless Authentication via Projected OIDC Token + Vault HTTP API
+# No sidecar required, no files written to disk or tmpfs.
+# The application reads the short-lived projected EKS OIDC token (/var/run/secrets/tokens/vault-token)
+# and exchanges it directly with HashiCorp Vault's /v1/auth/jwt/login endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-processor-app-code
+  namespace: app-ns
+data:
+  main.py: |
+    import base64
+    import json
+    import os
+    import time
+    import urllib.request
+
+    VAULT_ADDR = os.getenv("VAULT_ADDR", "http://vault.vault.svc.cluster.local:8200")
+    VAULT_AUTH_PATH = os.getenv("VAULT_AUTH_PATH", "jwt")
+    VAULT_ROLE = os.getenv("VAULT_ROLE", "payment-processor")
+    SECRET_PATH = os.getenv("SECRET_PATH", "secret/data/payment-processor/config")
+    JWT_TOKEN_PATH = os.getenv("JWT_TOKEN_PATH", "/var/run/secrets/tokens/vault-token")
+
+
+    def inspect_jwt_claims(jwt_token: str) -> dict:
+        parts = jwt_token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+
+
+    def authenticate_with_oidc_jwt(jwt_token: str) -> dict:
+        url = f"{VAULT_ADDR}/v1/auth/{VAULT_AUTH_PATH}/login"
+        payload = json.dumps({"role": VAULT_ROLE, "jwt": jwt_token}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
+    def fetch_secret_in_memory(vault_client_token: str) -> dict:
+        url = f"{VAULT_ADDR}/v1/{SECRET_PATH}"
+        req = urllib.request.Request(
+            url, headers={"X-Vault-Token": vault_client_token}, method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return body["data"]["data"]
+
+
+    def main():
+        print("=== Secretless Workload Authentication (Pattern B: Direct OIDC JWT -> Vault) ===", flush=True)
+        while True:
+            try:
+                with open(JWT_TOKEN_PATH, "r", encoding="utf-8") as f:
+                    oidc_jwt = f.read().strip()
+
+                claims = inspect_jwt_claims(oidc_jwt)
+                print(
+                    f"[OIDC-JWT] iss={claims.get('iss')} | sub={claims.get('sub')} | aud={claims.get('aud')} | exp={claims.get('exp')}",
+                    flush=True,
+                )
+
+                auth_resp = authenticate_with_oidc_jwt(oidc_jwt)
+                client_token = auth_resp["auth"]["client_token"]
+                lease_duration = auth_resp["auth"]["lease_duration"]
+                policies = auth_resp["auth"]["policies"]
+                print(
+                    f"[VAULT-AUTH] Authenticated via OIDC! Policies={policies} | TokenTTL={lease_duration}s",
+                    flush=True,
+                )
+
+                secrets = fetch_secret_in_memory(client_token)
+                masked_stripe = secrets.get("STRIPE_API_KEY", "")[:12] + "************"
+                print(
+                    f"[IN-MEMORY-SECRET] Successfully fetched secrets in memory: DB_HOST={secrets.get('DB_HOST')} | DB_USER={secrets.get('DB_USER')} | STRIPE_API_KEY={masked_stripe}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[ERROR] Authentication/Secret retrieval cycle failed: {exc}", flush=True)
+
+            time.sleep(30)
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-processor-sdk
+  namespace: app-ns
+  labels:
+    app: payment-processor
+    pattern: direct-oidc-sdk
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-processor
+      pattern: direct-oidc-sdk
+  template:
+    metadata:
+      labels:
+        app: payment-processor
+        pattern: direct-oidc-sdk
+    spec:
+      serviceAccountName: payment-processor
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: workload
+          image: python:3.11-slim
+          command: ["python3", "/app/main.py"]
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+            - name: VAULT_AUTH_PATH
+              value: "jwt"
+            - name: VAULT_ROLE
+              value: "payment-processor"
+            - name: SECRET_PATH
+              value: "secret/data/payment-processor/config"
+            - name: JWT_TOKEN_PATH
+              value: "/var/run/secrets/tokens/vault-token"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: vault-oidc-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: vault-oidc-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: vault-token
+                  expirationSeconds: 600
+                  audience: vault
+        - name: app-code
+          configMap:
+            name: payment-processor-app-code

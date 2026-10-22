@@ -1,0 +1,79 @@
+# Pattern A: Secretless Authentication via Vault Agent Sidecar Injector
+# Uses a projected short-lived OIDC ServiceAccount token (aud: vault)
+# and renders secrets exclusively to an in-memory tmpfs volume (/vault/secrets/config.env).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-processor-agent
+  namespace: app-ns
+  labels:
+    app: payment-processor
+    pattern: vault-agent-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-processor
+      pattern: vault-agent-sidecar
+  template:
+    metadata:
+      labels:
+        app: payment-processor
+        pattern: vault-agent-sidecar
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/auth-type: "jwt"
+        vault.hashicorp.com/auth-path: "auth/jwt"
+        vault.hashicorp.com/auth-config-path: "/var/run/secrets/tokens/vault-token"
+        vault.hashicorp.com/role: "payment-processor"
+        vault.hashicorp.com/agent-inject-secret-config.env: "secret/data/payment-processor/config"
+        vault.hashicorp.com/agent-inject-template-config.env: |
+          {{- with secret "secret/data/payment-processor/config" -}}
+          export DB_HOST="{{ .Data.data.DB_HOST }}"
+          export DB_USER="{{ .Data.data.DB_USER }}"
+          export DB_PASSWORD="{{ .Data.data.DB_PASSWORD }}"
+          export STRIPE_API_KEY="{{ .Data.data.STRIPE_API_KEY }}"
+          export WEBHOOK_HMAC_KEY="{{ .Data.data.WEBHOOK_HMAC_KEY }}"
+          {{- end -}}
+    spec:
+      serviceAccountName: payment-processor
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: app
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[INFO] Starting Secretless Workload (Pattern A: Vault Agent Injector + OIDC)"
+              while true; do
+                if [ -f /vault/secrets/config.env ]; then
+                  . /vault/secrets/config.env
+                  echo "[SUCCESS] $(date -u +%FT%TZ) Loaded secrets from in-memory tmpfs | DB_HOST=$DB_HOST | DB_USER=$DB_USER | STRIPE_KEY_PREFIX=$(echo $STRIPE_API_KEY | cut -c1-12)***"
+                else
+                  echo "[WAITING] Waiting for Vault Agent sidecar to render /vault/secrets/config.env..."
+                fi
+                sleep 30
+              done
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: vault-oidc-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
+      volumes:
+        - name: vault-oidc-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: vault-token
+                  expirationSeconds: 600
+                  audience: vault

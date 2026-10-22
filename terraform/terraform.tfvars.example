@@ -1,0 +1,11 @@
+aws_region          = "us-east-1"
+project_name        = "secretless-oidc"
+environment         = "dev"
+vpc_cidr            = "10.20.0.0/16"
+eks_cluster_version = "1.29"
+node_instance_types = ["t3.medium"]
+vault_address       = "http://127.0.0.1:8200"
+vault_token         = "root"
+app_namespace       = "app-ns"
+app_service_account = "payment-processor"
+oidc_audience       = "vault"
